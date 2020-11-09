@@ -2,3 +2,8 @@ credentials.json
 mwu
 .DS_Store
 .idea
+files/client_secrets.json
+files/client_secret.json
+files/token.pickle
+files/*
+output
