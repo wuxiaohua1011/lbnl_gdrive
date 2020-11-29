@@ -22,14 +22,14 @@ tasks_mongo_store: MongoStore = MongoStore(database=loaded_info["database"],
                                            port=int(loaded_info['port']),
                                            username=loaded_info['username'],
                                            password=loaded_info['password'])
-mp_ids_to_upload = ["mvc-2970", "mvc-66", "mvc-3716", "mvc-2513", "mvc-9059"]
-gdrive_build = GDriveBuilder(sources=[local_mongo_store, tasks_mongo_store, materials_mongo_store],
-                             targets=local_mongo_store,
-                             source_root_dir=Path("/Volumes/KESU/lbnl_data/projects"),
-                             temporary_output_dir=Path("/Volumes/KESU/lbnl_data/output"),
-                             mp_ids_to_upload=mp_ids_to_upload)
-__builder__ = gdrive_build
+mp_ids_to_upload = ["mvc-8151", "mvc-8154", "mp-606511", "mp-612200", "mp-612447"]
+gdrive_builder = GDriveBuilder(sources=[local_mongo_store, tasks_mongo_store, materials_mongo_store],
+                               targets=local_mongo_store,
+                               source_root_dir=Path("/Volumes/KESU/lbnl_data/projects"),
+                               temporary_output_dir=Path("/Volumes/KESU/lbnl_data/output"),
+                               mp_ids_to_upload=mp_ids_to_upload)
 
-if __name__ == "__main__":
-    logging.getLogger("googleapiclient.discovery").setLevel(logging.ERROR)
-    gdrive_build.run()
+from monty.serialization import dumpfn
+
+# dumpfn(gdrive_builder, "./files/gdrive_builder.json")
+dumpfn(gdrive_builder, "gdrive_builder.json")

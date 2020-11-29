@@ -1,5 +1,6 @@
 from typing import List, Iterable, Union, Any, Dict, Tuple
 from maggma.core.builder import Builder
+from maggma.stores.mongolike import MongoStore
 from maggma.core.store import Store
 from pathlib import Path
 import os
@@ -9,52 +10,59 @@ from itertools import chain
 from g_drive.models import GDriveLog, TaskRecord
 from datetime import datetime
 from typing import Optional
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
+# from googleapiclient.discovery import build
+# from google.oauth2.credentials import Credentials
 import pickle
 import os.path
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+# from googleapiclient.discovery import build
+# from google.oauth2.credentials import Credentials
+# from google_auth_oauthlib.flow import InstalledAppFlow
+# from google.auth.transport.requests import Request
 from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 import google
 from typing import Set
 import pprint
 from tqdm import tqdm
-from .utilities import make_tar_file
-from .utilities import GDrive
+from .utilities import make_tar_file, run_command
+# from .utilities import GDrive
+from maggma.core.store import Sort
+
 
 
 class GDriveBuilder(Builder):
     def __init__(self, sources: Union[List[Store], Store],
                  targets: Union[List[Store], Store],
                  mp_ids_to_upload: List[str],
-                 root_dir_path: Path,
+                 source_root_dir: Union[Path, str],
                  token_file_location: Path = Path("./files/token.pickle"),
                  secret_location: Path = Path("./files/client_secrets.json"),
                  garden_id: str = "1kKqZQh5v6YiW1lE8bS2q7ZrE0isHFYqu",
-                 output_dir: Path = Path("./output"),
+                 temporary_output_dir: Union[Path, str] = Path("./output"),
+                 limit: int = 1000,
                  gdrive_scope=None):
         super().__init__(sources, targets)
         if gdrive_scope is None:
             gdrive_scope = ['https://www.googleapis.com/auth/drive']
-        self.root_dir_path = root_dir_path
+        self.limit: int = limit
+        self.source_root_dir: Path = Path(source_root_dir)
         self.mongo_record_store = self.sources[0]
         self.tasks_mongo_store = self.sources[1]
+        self.materials_mongo_store = self.sources[2]
         self.mp_ids_to_upload = mp_ids_to_upload
-        self.gdrive = GDrive(token_file_location=token_file_location,
-                             secret_location=secret_location,
-                             garden_id=garden_id,
-                             gdrive_scope=gdrive_scope)
-        self.output_dir: Path = output_dir
-
-        if root_dir_path.exists() is False:
-            raise NotADirectoryError(f"Root Directory {root_dir_path} does not exist")
-        if output_dir.exists() is False:
-            self.logger.debug(f"creating tmp directory {output_dir}")
-            output_dir.mkdir(parents=True, exist_ok=True)
+        # self.gdrive = GDrive(token_file_location=token_file_location,
+        #                      secret_location=secret_location,
+        #                      garden_id=garden_id,
+        #                      gdrive_scope=gdrive_scope)
+        self.output_dir: Path = Path(temporary_output_dir)
+        self.emmet_restore_file_path: Path = self.output_dir / f"emmet_restore_{datetime.now()}.txt"
+        self.rclone_flags = ["--multi-thread-streams=5"]
+        self.rclone_options = ["-P"]
+        if self.source_root_dir.exists() is False:
+            raise NotADirectoryError(f"Root Directory {source_root_dir} does not exist")
+        if self.output_dir.exists() is False:
+            self.logger.debug(f"creating tmp directory {temporary_output_dir}")
+            temporary_output_dir.mkdir(parents=True, exist_ok=True)
 
     def get_items(self) -> Tuple[str, List[str]]:
         """
@@ -69,230 +77,63 @@ class GDriveBuilder(Builder):
         # {block -> [path, path, path, path]}
         # find all blessed tasks
         # fetch from missing launchers from GDrive from HPSS
+
+        # paths_dict: Dict[str, List[str]] = self.scan_local_file_system(block_pattern="^block", end_pattern="^launcher")
+        # pprint.pprint(paths_dict)
         """
         1. Find a list of block launchers from blessed tasks
         """
         # get dir_paths for all passed in mp_ids
-        paths_dict: Dict[str, List[str]] = self.get_path_dict()
-        pprint.pprint(paths_dict)
-        paths_dict: Dict[str, List[str]] = self.scan_local_file_system(block_pattern="^block", end_pattern="^launcher")
-
-        for block_name, paths in paths_dict.items():
-            yield block_name, paths
-
-    def get_path_dict(self) -> Dict[str, List[str]]:
-        result: Dict[str, List[str]] = dict()
-        records = self.tasks_mongo_store.query(criteria={"task_id": {"$in": self.mp_ids_to_upload} }, properties=["task_id", "dir_name", "dir_name_full", "last_updated"])
-        for record in records:
-            task_record = TaskRecord.parse_obj(record)
-            block_name = task_record.dir_name.split('/')[0]
-            launcher_names = task_record.dir_name.split("/")[1:]
-            if block_name not in result:
-                result[block_name] = self.organize_launcher_names_from_launcher_names(launcher_names)
-        return result
-
-    def organize_launcher_names_from_launcher_names(self, launcher_names: List[str]):
-        """
-        turn [launcher-xxx, launcher-yyy, launcher-ccc] into
-        [launcher-xxx, launcher-xxx/launcher-yyy, launcher-xxx/launcher-yyy/launcher-ccc]
-
-        :param launcher_names: list of launcher names
-        :return: list of launcher names
-
-        """
-        self.logger.error("organize_launcher_names_from_launcher_names IS NOT IMPLEMENTED YET")
-        return launcher_names
+        paths = self.get_paths()
+        paths_organized: Dict[str, List[str]] = self.organize_path(paths=paths)
+        for block_name, launcher_paths in paths_organized.items():
+            yield block_name, launcher_paths
 
     def process_item(self, item: Tuple[str, List[str]]) -> Any:
         """
-
+        For each block
+                    1. zip up the block
         :param item:
         :return:
         """
-
-        """
-        For each block
-            1. run tape restore (which will only restore files that are NOT in local file system)
-            2. upload to GDrive
-        """
         block_name, launcher_paths = item[0], item[1]
         self.debug_msg(f"Processing Block [{block_name}]")
-        # create temporary directory that contains zipped up launchers
         self.compress_launchers(block_name, launcher_paths)
-        logs: List[GDriveLog] = self.upload_to_gdrive(block_name=block_name, launcher_paths=launcher_paths)
-        return logs
 
     def update_targets(self, items: List[List[GDriveLog]]):
         self.debug_msg(f"Updating local mongo database")
-        # for item_list in items:
-        #     self.debug_msg(f"Updating {item_list[0].block_name} with [{len(item_list) - 1}] launchers")
-        flatten_list: List[GDriveLog] = list(chain.from_iterable(items))
-        self.mongo_record_store.update(docs=[log.dict() for log in flatten_list], key="path")
+        self.upload_to_gdrive()
+        # so that we have a cache of what we've uploaded
+        self.update_local_mongo_db()
+
+    def upload_to_gdrive(self):
+        cmd = "rclone"
+        for flag in self.rclone_flags:
+            cmd += " " + flag
+
+        cmd += " copy "
+        for option in self.rclone_options:
+            cmd += " " + option
+        cmd += f"{self.output_dir.as_posix()} remote: "
+        run_command(cmd)
+
+    def update_local_mongo_db(self):
+        pass
 
     def finalize(self):
         super(GDriveBuilder, self).finalize()
         # self.remove_all_content_in_output_dir()
 
-    def scan_local_file_system(self, block_pattern="^block", end_pattern="^launcher") -> Dict[str, List[str]]:
-        # find blocks
-        blocks: List[str] = []
-        for block_name in os.listdir(self.root_dir_path.as_posix()):
-            matches = re.findall(block_pattern, block_name)
-            if len(matches) > 0:
-                blocks.append(block_name)
-
-        # find corresponding launchers
-        launchers: Dict[str, List[str]] = dict()
-        for block in blocks:
-            self.scan_local_file_helper(block=block, folder_prefix_path=Path(block), pattern=end_pattern, log=launchers)
-        return launchers
-
-    def scan_local_file_helper(self, block, folder_prefix_path: Path, pattern: str, log: dict):
-        for folder_name in os.listdir((self.root_dir_path / folder_prefix_path).as_posix()):
-            patterns = re.findall(pattern=pattern, string=folder_name)
-            if len(patterns) > 0:
-                if block not in log:
-                    log[block] = [(Path(folder_prefix_path) / folder_name).as_posix()]
-                else:
-                    log[block].append((Path(folder_prefix_path) / folder_name).as_posix())
-
-                self.scan_local_file_helper(block=block, folder_prefix_path=folder_prefix_path / folder_name,
-                                            pattern=pattern, log=log)
-
-    def check_if_block_exist(self, block_name) -> bool:
-        count = self.mongo_record_store.count(criteria={"block_name": block_name})
-        return True if count > 0 else False
-
-    def find_new_launcher_paths(self, block_name: str, launcher_paths: List[str]) -> List[str]:
-        if self.check_if_block_exist(block_name=block_name) is False:
-            return launcher_paths
-        else:
-            mongo_store_launcher_paths = self.find_mongo_store_launcher_paths(block_name)
-            launcher_path_diff = list(set(launcher_paths) - set(mongo_store_launcher_paths))
-            return launcher_path_diff
-
-    def find_mongo_store_launcher_paths(self, block_name) -> List[str]:
-        launcher_paths_raw: Dict[str] = self.mongo_record_store.query_one(criteria={"block_name": block_name},
-                                                                          properties={"launcher_paths": 1})
-        launcher_paths = launcher_paths_raw['launcher_paths']
-        return launcher_paths
-
     def debug_msg(self, msg):
         self.logger.debug(msg)
 
-    def upload_new_block(self, block_name, launcher_paths) -> List[GDriveLog]:
-        """
-        Upload an entire new block to google drive.
-        :param block_name: the name of the block
-        :param launcher_paths: the launchers that this block contains
-        :return:
-            list of GDrive records, to sync with mongo_record_store
-        """
-        self.debug_msg(f"Uploading new block {block_name} with {len(launcher_paths)} launchers")
-        # TODO upload to gdrive
-        # self.upload_to_gdrive(block_name, launcher_paths)
-
-        block_gdrive_log = GDriveLog(
-            GDriveID="test",
-            path=block_name,
-            last_updated=datetime.now(),
-            created_at=datetime.now(),
-            block_name=block_name,
-            is_block=True,
-            launcher_paths=launcher_paths
-        )
-        launcher_logs = [GDriveLog(
-            GDriveID="test",
-            path=(Path(block_name) / launcher_path).as_posix(),
-            last_updated=datetime.now(),
-            created_at=datetime.now(),
-            block_name=block_name,
-            is_block=False,
-            launcher_name=launcher_path
-        ) for launcher_path in launcher_paths]
-
-        all_gdrive_logs = [block_gdrive_log] + launcher_logs
-        return all_gdrive_logs
-
-    def upload_launchers_to_block(self, block_name: str, launcher_paths: List[str]) -> List[GDriveLog]:
-        self.debug_msg(f"Uploading to block {block_name} with {len(launcher_paths)} new launchers")
-        # TODO upload to gdrive
-
-        block_gdrive_log: GDriveLog = GDriveLog.parse_obj(self.mongo_record_store.query_one(criteria={"$and": [
-            {"block_name": block_name},
-            {"is_block": True}]
-        }
-        ))
-        block_gdrive_log.launcher_paths.append(launcher_paths)
-        launcher_logs = [GDriveLog(
-            GDriveID="test",
-            path=(Path(block_name) / launcher_path).as_posix(),
-            last_updated=datetime.now(),
-            created_at=datetime.now(),
-            block_name=block_name,
-            is_block=False,
-            launcher_name=launcher_path
-        ) for launcher_path in launcher_paths]
-        logs_to_update = [block_gdrive_log] + launcher_logs
-        return logs_to_update
-
-    def upload_to_gdrive(self, block_name: str, launcher_paths: List[str]) -> List[GDriveLog]:
-        self.logger.debug(f"Uploading {block_name} to Gdrive")
-        # create folder if block folder does not already exist on g drive
-        # otherwise, get the block folder id
-        result: List[GDriveLog] = []
-        if self.check_if_block_exist(block_name=block_name):
-            folder_gdrive_log: GDriveLog = self.get_block_record_from_mongo(block_name=block_name)
-            folder_id = folder_gdrive_log.GDriveID
-        else:
-            folder_id = self.gdrive.get_or_create_folder(folder_name=block_name)
-            folder_gdrive_log: GDriveLog = GDriveLog(
-                GDriveID=folder_id,
-                path=block_name,
-                block_name=block_name,
-                is_block=True,
-                launcher_paths=[]
-            )
-        result.append(folder_gdrive_log)
-        # if launcher*.tar.gz is not in gdrive, upload
-        # otherwise, don't do anything with that launcher
-        for launcher_path in launcher_paths[0: 1]:
-            launcher_status, launcher = self.is_launcher_in_gdrive(launcher_path)
-            if launcher_status is True:
-                pass
-            else:
-                status, launcher_gz_path = self.find_launcher_gz_path(Path(launcher_path))
-                status, file_id = self.gdrive.upload_file_to_folder(folder_id=folder_id,
-                                                                    file_path=Path(launcher_gz_path))
-                gdrive_log = GDriveLog(
-                    GDriveID=file_id,
-                    path=launcher_path,
-                    block_name=block_name,
-                    is_block=False,
-                    launcher_name=launcher_path
-                )
-                result.append(gdrive_log)
-                folder_gdrive_log.launcher_paths.append(launcher_path)
-        return result
-
     def compress_launchers(self, block_name: str, launcher_paths: List[str]):
-        self.logger.debug(f"Compressing lauchers for {block_name}")
+        self.logger.debug(f"Compressing [{len(launcher_paths)}] launchers for [{block_name}]")
         for launcher_path in launcher_paths:
+            source_dir = self.source_root_dir / launcher_path
             make_tar_file(output_dir=self.output_dir / block_name,
                           output_file_name=launcher_path.split("/")[-1],
-                          source_dir=self.root_dir_path / launcher_path)
-
-    def is_launcher_in_gdrive(self, launcher_path) -> Tuple[bool, Optional[GDriveLog]]:
-        item: Optional[dict] = self.mongo_record_store.query_one(criteria={"path": launcher_path})
-        return (False, None) if item is None else (True, GDriveLog.parse_obj(item))
-
-    def find_launcher_gz_path(self, launcher_path: Path) -> Tuple[bool, Optional[Path]]:
-        launcher_gz_path = Path((self.output_dir / launcher_path).as_posix() + ".tar.gz")
-        return (True, launcher_gz_path) if launcher_gz_path.exists() else (False, None)
-
-    def get_block_record_from_mongo(self, block_name) -> Optional[GDriveLog]:
-        record = self.mongo_record_store.query_one(criteria={"$and": [{"block_name": block_name}, {"is_block": True}]})
-        return None if record is None else GDriveLog.parse_obj(record)
+                          source_dir=source_dir)
 
     def remove_all_content_in_output_dir(self):
         import os
@@ -304,3 +145,82 @@ class GDriveBuilder(Builder):
             for d in dirs:
                 shutil.rmtree(os.path.join(root, d))
 
+    def get_paths(self) -> List[str]:
+        materials = self.materials_mongo_store.query(criteria={"deprecated": False,
+                                                               "task_id": {"$in": self.mp_ids_to_upload}},
+                                                     properties={"task_id": 1, "blessed_tasks": 1,
+                                                                 "last_updated": 1},
+                                                     sort={"last_updated": Sort.Descending}, limit=self.limit)
+        task_ids_to_query: List[str] = []
+        for material in materials:
+            if "blessed_tasks" in material:
+                blessed_tasks: dict = material["blessed_tasks"]
+                task_ids_to_query.extend(list(blessed_tasks.values()))
+            else:
+                print(f"material [{material['task_id']}] does not have blessed tasks")
+
+        tasks = self.tasks_mongo_store.query(criteria={"task_id": {"$in": task_ids_to_query}},
+                                             properties={"task_id": 1, "dir_name": 1})
+        emmet_restore_file = self.emmet_restore_file_path.open('w')
+        emmet_restore_list: List = []
+        for task in tasks:
+            dir_name: str = task["dir_name"]
+            start = dir_name.find("block_")
+            dir_name = dir_name[start:]
+            emmet_restore_file.write(dir_name + "\n")
+            emmet_restore_list.append(dir_name)
+        emmet_restore_file.close()
+        return emmet_restore_list
+
+    def organize_launchers(self, block_name: str, launcher_names: List[str]) -> List[str]:
+        """
+        turn [launcher-xxx, launcher-yyy, launcher-ccc] into
+        [block_name/launcher-xxx, block_name/launcher-xxx/launcher-yyy, block_name/launcher-xxx/launcher-yyy/launcher-ccc]
+
+        :param block_name: used to prepend block name
+        :param launcher_names: list of launcher names
+        :return: list of launcher names
+
+        """
+        result: List[str] = []
+        prev_name = block_name
+        for launcher_name in launcher_names:
+            curr_name = prev_name + "/" + launcher_name
+            result.append(curr_name)
+            prev_name = curr_name
+        return result
+
+    def organize_path(self, paths: List[str]) -> Dict[str, List[str]]:
+        result: Dict[str, List[str]] = dict()
+        for path in paths:
+            splitted: List[str] = path.split("/")
+            block_name, launcher_names = splitted[0], splitted[1:]
+            list_of_launchers = self.organize_launchers(block_name=block_name, launcher_names=launcher_names)
+            if block_name in result:
+                result[block_name].extend(list_of_launchers)
+            else:
+                result[block_name] = list_of_launchers
+        return result
+
+    def as_dict(self) -> dict:
+        d = dict()
+        d["limit"] = self.limit
+        d["sources"] = [self.mongo_record_store.as_dict(), self.tasks_mongo_store.as_dict(),
+                        self.materials_mongo_store.as_dict()]
+        d["targets"] = [self.mongo_record_store.as_dict()]
+        d["source_root_dir"] = self.source_root_dir.as_posix()
+        d["mp_ids_to_upload"] = self.mp_ids_to_upload
+        d["temporary_output_dir"] = self.output_dir.as_posix()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        local_mongo_store: MongoStore = MongoStore.from_dict(d["sources"][0])
+        tasks_mongo_store: MongoStore = MongoStore.from_dict(d["sources"][1])
+        materials_mongo_store: MongoStore = MongoStore.from_dict(d["sources"][2])
+        return GDriveBuilder(sources=[local_mongo_store, tasks_mongo_store, materials_mongo_store],
+                             targets=local_mongo_store,
+                             source_root_dir=Path(d["source_root_dir"]),
+                             temporary_output_dir=Path(d["temporary_output_dir"]),
+                             mp_ids_to_upload=d["mp_ids_to_upload"],
+                             limit=d["limit"])
